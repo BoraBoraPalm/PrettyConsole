@@ -18,13 +18,13 @@ PrettyConsole is a lightweight Python library that enhances your terminal output
 You can install PrettyConsole directly from GitHub using pip:
 
 ```bash
-pip install git+https://github.com/yourusername/PrettyConsole.git
+pip install git+https://github.com/BoraBoraPalm/PrettyConsole.git
 ```
 
 For development purposes, clone the repository and install it in editable mode:
 
 ```bash
-git clone https://github.com/yourusername/PrettyConsole.git
+git clone https://github.com/BoraBoraPalm/PrettyConsole.git
 cd PrettyConsole_
 pip install -e .
 ```
