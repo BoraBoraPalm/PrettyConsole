@@ -1,31 +1,165 @@
 from colorama import Fore, Back, Style
 import textwrap
+import shutil
 import time
 import sys
 
 class Console:
-    __counter = 1  # Global __counter which will increase with each call of the printf function.
-    __max_message_length = 100  # Space in the console reserved for the text of the user
-    __indent = " " * 22  # Intent for the long text
+    __counter = 1                          # Global __counter which will increase with each call of the printf function.
+    __max_message_length_override = None   # Manual width override set via @set_max_message_length. None = auto-detect from terminal.
+    __max_message_length_fallback = 100    # Used when terminal size cannot be detected (e.g. plain Jupyter without $COLUMNS set).
+    __max_message_length_min = 40          # Floor for the auto-detected width so very narrow terminals don't break the layout.
+    __indent = " " * 22                    # Intent for the long text
     __time_previous = 0
-    __collected_lines = ""
+    __collected_lines = {}                 # Tag -> collected string. Allows grouping lines under different tags.
+    __debug_mode = False                   # Global toggle for caller location info (module.Class.method:line)
 
     @staticmethod
-    def printf(status: str, message: str, long_format: bool = False, long_annotation: str = "", mute: bool = False) -> None:
+    def set_debug_mode(enabled: bool) -> None:
+        """
+        Globally enable or disable caller location info for all printf calls. Useful to switch on during development
+        without touching every call site.
+
+        :param enabled: True to enable, False to disable.
+        :return: None
+        """
+        Console.__debug_mode = enabled
+
+    @staticmethod
+    def set_max_message_length(length) -> None:
+        """
+        Manually pin the max message length used by @printf. Pass None to re-enable auto-detection from the terminal
+        size. Useful in Jupyter, where the rendered cell width cannot be queried from Python -- the kernel only sees
+        HTML/CSS that gets rendered later in the browser. Two practical patterns:
+          - Set $COLUMNS at the top of the notebook (then auto-detection picks it up).
+          - Call this method once with a fixed width and forget about it.
+
+        :param length: An integer width in characters, or None to fall back to auto-detection.
+        :return: None
+        """
+        Console.__max_message_length_override = length
+
+    @staticmethod
+    def _get_max_message_length() -> int:
+        """
+        Resolve the current max message length. Resolution order:
+          1. Manual override set via @set_max_message_length.
+          2. Live terminal width from shutil.get_terminal_size (also honors $COLUMNS, which is the practical way to
+             size things in Jupyter).
+          3. The configured fallback constant.
+        Resolved on every @printf call, so resizing a real terminal between calls just works without reconfiguring.
+
+        :return: Width in characters available for the message line.
+        """
+        if Console.__max_message_length_override is not None:
+            return Console.__max_message_length_override
+
+        cols = shutil.get_terminal_size(fallback=(Console.__max_message_length_fallback, 24)).columns
+        # Guard against absurdly narrow terminals -- below this floor the indented output looks worse than just wrapping.
+        safety_margin = 0
+
+        return max(Console.__max_message_length_min, cols - safety_margin)
+
+    @staticmethod
+    def _wrap_message_lines(message: str, width: int) -> list:
+        """
+        Wrap `message` into a list of lines, each at most `width` characters wide. Unified for both inputs that already
+        contain "\n" and inputs that do not -- this is more stable than calling textwrap.fill on the whole string,
+        because the latter only handles the no-"\n" case well. Specifically:
+          - Existing "\n" in the input are treated as hard breaks and preserved exactly. Each resulting logical line is
+            then word-wrapped independently, so an overlong manual line (e.g. a long URL or file path inside a
+            multi-line message) also gets wrapped instead of overflowing the terminal.
+          - Tokens longer than `width` (long URLs, file paths, identifiers) get hard-split via break_long_words=True
+            (textwrap default) instead of being left to overflow.
+          - break_on_hyphens=False avoids surprise breaks inside hyphenated names (kebab-case, option flags,
+            file-like-names). textwrap defaults to True which is good for prose but bad for technical output.
+          - tabsize=4 keeps tab-expanded width predictable (textwrap default is 8, which inflates width unexpectedly).
+          - Blank input lines are preserved as blank output lines, so paragraph spacing survives.
+
+        :param message: The full message string. May contain "\n".
+        :param width: Target maximum width per line in characters. Values < 1 are clamped to 1.
+        :return: List of wrapped lines without trailing "\n" on any element.
+        """
+        width = max(1, width)
+
+        wrapped_lines = []
+        for raw_line in message.split("\n"):
+            # textwrap.wrap returns [] for empty / whitespace-only input -- treat that as a blank line so paragraph
+            # spacing in the input survives wrapping.
+            chunks = textwrap.wrap(raw_line, width=width, break_on_hyphens=False, tabsize=4)
+            wrapped_lines.extend(chunks if chunks else [""])
+
+        return wrapped_lines
+
+    @staticmethod
+    def _get_caller_info(stack_offset: int) -> str:
+        """
+        Return 'module.Class.method:line' or 'module.function:line' for the caller. Uses dotted module name instead of
+        the absolute filesystem path so committed Jupyter outputs stay clean.
+
+        :param stack_offset: How many frames up to look for the real caller.
+        :return: Formatted string with module, optional class, function and line number.
+        """
+        try:
+            frame = sys._getframe(stack_offset)
+        except ValueError:
+            return "<unknown>"
+
+        module = frame.f_globals.get('__name__', '<module>')
+        func_name = frame.f_code.co_name
+        line_no = frame.f_lineno
+
+        # Detect class via self/cls in the frame's locals (works for instance & classmethods).
+        class_name = None
+        if 'self' in frame.f_locals:
+            class_name = type(frame.f_locals['self']).__name__
+        elif 'cls' in frame.f_locals:
+            cls = frame.f_locals['cls']
+            if isinstance(cls, type):
+                class_name = cls.__name__
+
+        qualified = f"{module}.{class_name}.{func_name}" if class_name else f"{module}.{func_name}"
+        return f"{qualified}:{line_no}"
+
+    @staticmethod
+    def printf(status: str,
+               message: str,
+               long_format: bool = False,
+               long_annotation: str = "",
+               mute: bool = False,
+               raise_error=False,
+               debug: bool = False,
+               _stack_offset: int = 1) -> None:
         """
         A formatted output. The user can insert the status and the corresponding message.
 
         :param status: possible options as strings: success, error, warning.
-        :param message: a desired string message with length <= 100 or a message which contains several lines, where each
-                        line is <= 100 and ends with an \n
+        :param message: a desired string message with length <= max_message_length or a message which contains several
+                        lines, where each line is <= max_message_length and ends with an \n. The max_message_length is
+                        resolved at call time -- see @_get_max_message_length and @set_max_message_length.
         :param long_format: default is False. If true a special case, where several lines are printed and "--v" is displayed.
         :param long_annotation: default is "", thus empty string. Just use it if long_format is set to True. Then, an
                                 annotation in form of (my annotation) is created after the arrow pointing to the text.
                                 Thus: [ i ][ message ] ---v  (my annotation)
         :param mute: If true then no console output. Maybe useful for already implemented printf. Thus, no need to comment.
+        :param raise_error: If status == "error", raise after printing. Pass an exception class (recommended) to allow
+                            targeted catching, or True as a shortcut for a clean termination with caller info and no
+                            Python traceback. Default False = no raise.
+        :param debug: If True (or globally enabled via @set_debug_mode), append the caller location on a new line below
+                      the message. Format: module.Class.method:line
+        :param _stack_offset: Internal. How many frames up to look for the caller. Used by wrappers like
+                              @printf_collected_lines to skip themselves.
         :return: None
         """
         if mute: return
+
+        # For raise_error=True on an error status -> wrap the reason in (!!!) markers and add termination location
+        # below. Forces long_format so both lines render indented under the status header.
+        is_generic_terminate = (raise_error is True) and (status == "error")
+        if is_generic_terminate:
+            caller_loc = Console._get_caller_info(_stack_offset + 1)
+            message = f"(!!!) {message} (!!!)\nProgram terminated at {caller_loc}"
+            long_format = True
 
         # Colors for the respective status
         colors = {
@@ -35,53 +169,98 @@ class Console:
             'info': Fore.LIGHTBLUE_EX,
         }
 
+        # Resolve caller info once if debugging is on (either per-call or globally).
+        show_debug = debug or Console.__debug_mode
+        caller = Console._get_caller_info(_stack_offset + 1) if show_debug else None
+
         long_annotation = f" ({long_annotation})" if long_annotation != "" else ""
 
-        # Distinguish between a "normal" message length and a "long" one. Thus, print the long on in the next line.
-        if (len(message) <= Console.__max_message_length) and (long_format is False):
-            output = f"[{Console.__counter:^5}][{colors[status] + status + Style.RESET_ALL:^18}] >> {message:<100} \n"
+        # Resolve the max message length once per call. Same value is then used for both the "fits on one line" check
+        # and the wrap_width below -- prevents inconsistent results if the terminal would get resized mid-call.
+        max_len = Console._get_max_message_length()
+
+        # Single-line fast path: only when the message comfortably fits AND has no manual "\n" AND long_format wasn't
+        # requested. Everything else goes through the unified long-format path below.
+        is_single_line = (len(message) <= max_len) and ("\n" not in message) and (long_format is False)
+
+        if is_single_line:
+            output = f"[{Console.__counter:^5}][{colors[status] + status + Style.RESET_ALL:^18}] >> {message}\n"
         else:
-            output = f"[{Console.__counter:^5}][{colors[status] + status + Style.RESET_ALL:^18}] ---v {long_annotation}"
+            # Unified long-format path: handles messages with and without "\n" identically. The wrap helper splits on
+            # "\n" first (preserving the user's intended hard breaks) and word-wraps each logical line independently,
+            # so overlong manual lines (long URLs, file paths) also get wrapped instead of overflowing the terminal.
+            wrap_width = max_len - len(Console.__indent)
+            lines = Console._wrap_message_lines(message, wrap_width)
 
-            # Distinguish between a long text already formatted by including "\n" and not formatted long text. If the
-            # text is not formatted and long then an automatically new lines are generated. Further, the text will be
-            # indented.
-            if "\n" in message:  # for keeping the formatted output
-                lines = message.split('\n')
-                lines[0] = "\n" + Console.__indent + lines[0]
-            else:  # formation by automatic line break
-                output += " (automatic line breaks) \n"
-                lines = textwrap.fill(message, width=Console.__max_message_length).split('\n')
+            # Add "(automatic line breaks)" to the annotation only if wrapping actually inserted breaks beyond what the
+            # user already provided. len(output_lines) > len(input_lines) means at least one logical line got split.
+            input_logical_lines = message.split("\n")
+            auto_suffix = " (automatic line breaks)" if len(lines) > len(input_logical_lines) else ""
 
-            # Just print the long text line by line
+            output = (f"[{Console.__counter:^5}][{colors[status] + status + Style.RESET_ALL:^18}] ---v "
+                      f"{long_annotation}{auto_suffix}\n")
             for line in lines:
                 output += Console.__indent + line + "\n"
+
+        # Debug location on its own indented line so the message column stays clean for long and short messages alike.
+        if show_debug:
+            output += f"{Console.__indent}↳ from {caller}\n"
 
         print(output, end="")
 
         Console.__counter += 1  # Just increasing the global counter.
 
+        # Raise after printing so the log line is visible right before the traceback.
+        if raise_error and status == "error":
+            if isinstance(raise_error, type) and issubclass(raise_error, BaseException):
+                # Custom exception class -> raise as-is, user controls own message and catch behavior.
+                raise raise_error(message)
+            else:
+                # raise_error=True -> message was already formatted above with (!!!) markers and caller info.
+                # Just exit cleanly here, no Python traceback needed.
+                sys.exit(1)
+
     @staticmethod
-    def add_lines(line: str) -> None:
+    def add_lines(line: str, tag: str = "default") -> None:
         """
-        Add lines which can then be printed collected with @print_collected_lines
+        Add lines which can then be printed collected with @printf_collected_lines. Lines are grouped by tag, so several
+        independent groups can be collected in parallel.
 
         :param line: Some string.
+        :param tag: Optional tag to group lines under. Defaults to "default", so old call sites keep working unchanged.
         :return: Nothing
         """
-        Console.__collected_lines += line + "\n"
+        if tag not in Console.__collected_lines:
+            Console.__collected_lines[tag] = ""
+        Console.__collected_lines[tag] += line + "\n"
 
     @staticmethod
-    def printf_collected_lines(status: str, mute: bool = False) -> None:
+    def printf_collected_lines(status: str, tag: str = "default", show_tag: bool = False, mute: bool = False,
+                               raise_error=False, debug: bool = False) -> None:
         """
-        Print the collected lines by the method @add_lines
+        Print the collected lines by the method @add_lines for a specific tag, then clear the collected lines for that
+        tag only.
 
         :param status: according to the statuses defined in @printf
+        :param tag: The tag whose collected lines should be printed. Defaults to "default".
+        :param show_tag: If True the tag name is appended to the annotation. Defaults to False.
         :param mute: mutes the output.
+        :param raise_error: Passed through to @printf. If truthy and status == "error", raise after printing.
+        :param debug: Passed through to @printf. If True, show caller location below the message.
         :return: Nothing
         """
-        Console.printf(status, Console.__collected_lines, long_format=True, long_annotation="collected several lines", mute=mute)
-        Console.__collected_lines = ""
+        if tag not in Console.__collected_lines or Console.__collected_lines[tag] == "":
+            Console.printf("warning", f"No collected lines found for tag '{tag}'.", mute=mute)
+            return
+
+        annotation = "collected several lines"
+        if show_tag:
+            annotation += f" [tag: {tag}]"
+
+        # _stack_offset=2 so the debug info points at the caller of printf_collected_lines, not at this method itself.
+        Console.printf(status, Console.__collected_lines[tag], long_format=True, long_annotation=annotation, mute=mute,
+                       raise_error=raise_error, debug=debug, _stack_offset=2)
+        Console.__collected_lines[tag] = ""
 
     @staticmethod
     def printf_section(title: str) -> None:
@@ -101,7 +280,7 @@ class Console:
         To ask the user to continue or terminate the program. Another option is to return either True or False.
         Example usage: if the required estimated space exceeds the desired limit.
 
-        :return:
+        :return: boolean
         """
         answer = input(f"{Back.LIGHTYELLOW_EX + Fore.BLACK + '[CONTINUE (y/n) ?]' + Style.RESET_ALL + ' >> '}{message} -> ").lower()
         if answer == "n":
@@ -169,3 +348,6 @@ class Console:
         """
         took_time = f"TOOK {round(time.time() - Console.__time_previous, 3)} sec"
         print(f"{Back.LIGHTBLUE_EX + Fore.BLACK}{took_time:^30}{Style.RESET_ALL}")
+
+
+

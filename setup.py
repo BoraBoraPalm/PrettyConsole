@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="prettyconsole",                                 # Name of the library
-    version="0.1",
+    version="0.2",
     packages=find_packages(),
     description="A library for pretty console outputs.",
     author="Markus Schuster",
