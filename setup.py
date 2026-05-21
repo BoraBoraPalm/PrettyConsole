@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="prettyconsole",                                 # Name of the library
-    version="0.2",
+    version="0.3",
     packages=find_packages(),
     description="A library for pretty console outputs.",
     author="Markus Schuster",
@@ -10,5 +10,5 @@ setup(
     install_requires=[
         "colorama",                                       # Dependencies
     ],
-    python_requires=">=3.6",
+    python_requires=">=3.8",
 )

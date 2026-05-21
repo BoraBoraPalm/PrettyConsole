@@ -1,10 +1,12 @@
 from colorama import Fore, Back, Style
+import traceback
 import textwrap
 import shutil
 import time
 import sys
 
 class Console:
+    # The 'normal' parameters
     __counter = 1                          # Global __counter which will increase with each call of the printf function.
     __max_message_length_override = None   # Manual width override set via @set_max_message_length. None = auto-detect from terminal.
     __max_message_length_fallback = 100    # Used when terminal size cannot be detected (e.g. plain Jupyter without $COLUMNS set).
@@ -13,6 +15,13 @@ class Console:
     __time_previous = 0
     __collected_lines = {}                 # Tag -> collected string. Allows grouping lines under different tags.
     __debug_mode = False                   # Global toggle for caller location info (module.Class.method:line)
+
+    # For shortening the traceback length
+    __short_paths_levels = 0                    # Number of parent folders to keep above filename in tracebacks. 0 = disabled (Python default).
+    __short_paths_hooked = False                # Tracks whether the traceback hooks are installed, to prevent double-patching.
+    __short_paths_orig_extract_tb = None        # Holds the original traceback.extract_tb (classic API entry point).
+    __short_paths_orig_summary_extract = None   # Holds the original traceback.StackSummary.extract (modern API used by TracebackException in 3.10+).
+    __short_paths_orig_excepthook = None        # Holds the original sys.excepthook (uncaught exceptions in main thread).
 
     @staticmethod
     def set_debug_mode(enabled: bool) -> None:
@@ -38,6 +47,49 @@ class Console:
         :return: None
         """
         Console.__max_message_length_override = length
+
+    @staticmethod
+    def set_short_traceback_paths(levels: int = 2) -> None:
+        """
+        Globally shorten file paths in Python tracebacks to filename + @levels parent folders. Useful in deeply nested
+        project trees where the full absolute path adds noise and pushes the actual filename off the screen. So a path
+        like /home/user/proj/src/utils/helpers.py becomes src/utils/helpers.py with the default @levels=2.
+
+        Covers the places Python prints an exception in a single-threaded program:
+          - Uncaught exceptions in the main thread (sys.excepthook)
+          - Caught exceptions via traceback.print_exc / format_exc / format_tb / ...
+          - Modern TracebackException API in Python 3.10+ (StackSummary.extract)
+          - Exceptions raised via @printf with raise_error=SomeExceptionClass
+
+        Safe to call multiple times: hooks are only installed once, subsequent calls just update @levels. Call once at
+        the top of the main entry point, before any code that might raise.
+
+        :param levels: How many parent folders to keep above the filename. Default 2. Pass 0 to leave Python defaults
+                       untouched (no-op if not previously enabled).
+        :return: None
+        """
+        Console.__short_paths_levels = levels
+
+        if Console.__short_paths_hooked:        # Already patched -- just update @levels and return, no double-wrapping.
+            return
+        if levels <= 0:                         # No reason to install hooks for a disabled depth. User can re-call with levels >= 1 later.
+            return
+
+        # Patch the traceback module entry points used by caught exceptions. @extract_tb covers the classic API
+        # (print_exc, format_exc, format_tb, ...). @StackSummary.extract covers the modern API used by
+        # TracebackException in Python 3.10+, which is what traceback.print_exception(exc) routes through and which
+        # does NOT go via @extract_tb -- so both need patching for full coverage.
+        Console.__short_paths_orig_extract_tb = traceback.extract_tb
+        traceback.extract_tb = Console.__short_paths_patched_extract_tb
+
+        Console.__short_paths_orig_summary_extract = traceback.StackSummary.extract
+        traceback.StackSummary.extract = staticmethod(Console.__short_paths_patched_summary_extract)
+
+        # Patch the global exception hook for uncaught exceptions in the main thread.
+        Console.__short_paths_orig_excepthook = sys.excepthook
+        sys.excepthook = Console.__short_paths_excepthook
+
+        Console.__short_paths_hooked = True
 
     @staticmethod
     def _get_max_message_length() -> int:
@@ -120,6 +172,52 @@ class Console:
 
         qualified = f"{module}.{class_name}.{func_name}" if class_name else f"{module}.{func_name}"
         return f"{qualified}:{line_no}"
+
+    @staticmethod
+    def _shorten_path(path: str) -> str:
+        """
+        Reduce the given path to its filename plus @__short_paths_levels parent folders. Falls back gracefully -- if
+        the path has fewer folders than @__short_paths_levels, whatever is available is returned without raising.
+        Windows backslashes are normalised so the result looks the same cross-platform.
+
+        :param path: Full or relative file path.
+        :return: Shortened path string.
+        """
+        parts = path.replace("\\", "/").split("/")     # Normalise Windows separators so the split works cross-platform.
+        return "/".join(parts[-(Console.__short_paths_levels + 1):])
+
+    @staticmethod
+    def __short_paths_patched_extract_tb(tb, limit=None):
+        """
+        Drop-in replacement for traceback.extract_tb. Covers the classic API path: print_exc, format_exc, format_tb,
+        print_exception (pre-3.10), and anything else built on extract_tb. Installed by @set_short_traceback_paths.
+        """
+        frames = Console.__short_paths_orig_extract_tb(tb, limit)
+        for frame in frames:
+            frame.filename = Console._shorten_path(frame.filename)
+        return frames
+
+    @staticmethod
+    def __short_paths_patched_summary_extract(*args, **kwargs):
+        """
+        Drop-in replacement for traceback.StackSummary.extract. Covers the modern API used by TracebackException in
+        Python 3.10+, which does NOT route through @extract_tb. Installed by @set_short_traceback_paths.
+        """
+        frames = Console.__short_paths_orig_summary_extract(*args, **kwargs)
+        for frame in frames:
+            frame.filename = Console._shorten_path(frame.filename)
+        return frames
+
+    @staticmethod
+    def __short_paths_excepthook(exc_type, exc_value, exc_tb) -> None:
+        """
+        Replacement for sys.excepthook. Prints uncaught exceptions in the main thread with shortened paths. Mirrors
+        Python's default formatting otherwise so the output still looks familiar. Installed by @set_short_traceback_paths.
+        """
+        frames = traceback.extract_tb(exc_tb)          # Already shortened via the patched @extract_tb above.
+        print("Traceback (most recent call last):", file=sys.stderr)
+        print("".join(traceback.format_list(frames)), end="", file=sys.stderr)
+        print(f"{exc_type.__name__}: {exc_value}", file=sys.stderr)
 
     @staticmethod
     def printf(status: str,
@@ -348,6 +446,4 @@ class Console:
         """
         took_time = f"TOOK {round(time.time() - Console.__time_previous, 3)} sec"
         print(f"{Back.LIGHTBLUE_EX + Fore.BLACK}{took_time:^30}{Style.RESET_ALL}")
-
-
 

@@ -1,8 +1,8 @@
 # PrettyConsole
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)  
-[![Python Version](https://img.shields.io/badge/Python-3.6%2B-blue.svg)](https://www.python.org/downloads/)
-![Version](https://img.shields.io/badge/Version-0.2-green.svg)
+[![Python Version](https://img.shields.io/badge/Python-3.8%2B-blue.svg)](https://www.python.org/downloads/)
+![Version](https://img.shields.io/badge/Version-0.3-green.svg)
 
 ## What is PrettyConsole?
 
@@ -13,6 +13,10 @@ PrettyConsole is a lightweight Python library that enhances your terminal output
 - **Timer Utilities:** Start and stop timers to measure execution time for your code.
 - **Collect and Print Lines:** Accumulate multiple lines of text and print them together as a grouped message.
 - **User Interaction:** Prompt users with customizable confirmation messages.
+
+What's New in Version 0.3:
+
+- **Short Traceback Paths:** Shorten file paths in Python tracebacks to filename + N parent folders, instead of the full absolute path. Activate once with `Console.set_short_traceback_paths(N)`, pass `0` to deactivate. Covers `printf(... raise_error=...)`, uncaught exceptions, manual `traceback.print_exc()` calls, and the modern `TracebackException` API used in Python 3.10+.
 
 What's New in Version 0.2:
 
@@ -41,7 +45,7 @@ pip install -e .
 
 ## Requirements
 
-- **Python 3.6+**: PrettyConsole is built for modern versions of Python.
+- **Python 3.8+**: PrettyConsole is built for modern versions of Python.
 - **[colorama](https://pypi.org/project/colorama/)**: Used to render colored text on various platforms.
 
 All dependencies will be automatically installed when you install PrettyConsole.
@@ -268,6 +272,37 @@ except DataError as e:
 [  2  ][  error  ] >> Pipeline failed.
 [  3  ][ success ] >> Caught DataError: Pipeline failed.
 ```
+
+### Short traceback paths
+
+Globally shorten file paths in Python tracebacks to just the filename plus N parent folders. Useful in deeply nested project trees where the full absolute path adds noise and pushes the actual filename off the screen. Call once at the top of your main entry point; the setting applies to every traceback printed from that point on -- `printf(... raise_error=...)`, uncaught exceptions, manual `traceback.print_exc()` calls, and the modern `TracebackException` API used in Python 3.10+.
+
+```python
+Console.set_short_traceback_paths(2)   # filename + 2 parent folders
+
+class DataError(Exception):
+    pass
+
+Console.printf('error', 'Pipeline failed.', raise_error=DataError)
+```
+
+```text
+[  4  ][  error  ] >> Pipeline failed.
+Traceback (most recent call last):
+  File "examples/demo.py", line 5, in <module>
+    Console.printf('error', 'Pipeline failed.', raise_error=DataError)
+  File "prettyconsole/console.py", line 198, in printf
+    raise raise_error(message)
+DataError: Pipeline failed.
+```
+
+Without `set_short_traceback_paths`, the same traceback would show full absolute paths like `/home/user/projects/myapp/examples/demo.py`. To deactivate at runtime and restore Python's default behaviour:
+
+```python
+Console.set_short_traceback_paths(0)   # back to full absolute paths
+```
+
+Safe to call any number of times -- subsequent calls just update the depth; passing `0` removes the installed hooks and restores the originals.
 
 ## Notes
 
